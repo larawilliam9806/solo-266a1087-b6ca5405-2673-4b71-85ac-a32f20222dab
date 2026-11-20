@@ -294,3 +294,188 @@ def test_corrections_listing(client):
     assert rows[0]["kind"] == "insert" and rows[0]["status"] == "active"
     assert rows[1]["touches_corrections"] == [1]
     assert rows[1]["deleted_text"] == "Y"
+
+
+# ---------------------------------------------------------------- 展陈引文
+
+def confirm(client, doc, draft, version, start, end):
+    return client.post(f"/documents/{doc}/citations", json={
+        "draft_number": draft, "version_number": version,
+        "start": start, "end": end})
+
+
+def cite(client, doc, draft, start, end, seen=None):
+    if seen is None:
+        seen = version(client, doc)["revision"]
+    r = confirm(client, doc, draft, seen, start, end)
+    assert r.status_code == 201, r.text
+    return r.json()["citation_number"]
+
+
+def citation(client, doc, number):
+    r = client.get(f"/documents/{doc}/citations/{number}")
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_confirm_citation_returns_number_and_snapshot(client):
+    doc = import_doc(client, "张三住在北京市东城区。")
+    r = confirm(client, doc, 0, 0, 4, 7)
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["citation_number"] == 1
+    assert body["text"] == "北京市"
+    assert (body["start"], body["end"]) == (4, 7)
+    got = citation(client, doc, 1)
+    assert got["status"] == "active"
+    assert got["text"] == "北京市"
+    assert (got["start"], got["end"]) == (4, 7)
+    assert got["confirmed_version"] == 0
+    assert got["version_number"] == 0     # 现稿版号
+
+
+def test_confirm_rejects_stale_version(client):
+    doc = import_doc(client, "ABCDEFG")
+    correct(client, doc, 0, 0, "x")            # revision -> 1
+    r = confirm(client, doc, 0, 0, 1, 4)       # 用旧版号 0
+    assert r.status_code == 409
+    r = confirm(client, doc, 1, 1, 1, 4)       # 现版号 1
+    assert r.status_code == 201
+
+
+def test_confirm_rejects_empty_or_out_of_range_span(client):
+    doc = import_doc(client, "ABCDEFG", entities=[])
+    assert confirm(client, doc, 0, 0, 2, 2).status_code == 400   # 空区间
+    assert confirm(client, doc, 0, 0, 3, 2).status_code == 400   # 反向
+    assert confirm(client, doc, 0, 0, 0, 8).status_code == 400   # 越界
+    assert confirm(client, doc, 0, 0, 0, 7).status_code == 201
+    assert client.get(f"/documents/{doc}/citations/99").status_code == 404
+
+
+
+def test_citation_shifts_on_edits_outside_span(client):
+    doc = import_doc(client, "张三住在北京市东城区。")
+    n = cite(client, doc, 0, 4, 7)                 # “北京市”
+    correct(client, doc, 0, 0, "旁白：")            # 文首插 3 字，引文整体右移
+    got = citation(client, doc, n)
+    assert got["status"] == "active"
+    assert got["text"] == "北京市"
+    assert (got["start"], got["end"]) == (7, 10)
+    correct(client, doc, 0, 3)                     # 又删掉“旁白：”，左移回来
+    got = citation(client, doc, n)
+    assert (got["start"], got["end"]) == (4, 7)
+    assert got["status"] == "active"
+
+
+def test_boundary_inserts_are_outside_citation(client):
+    doc = import_doc(client, "张三住在北京市东城区。")
+    n = cite(client, doc, 0, 4, 7)
+    correct(client, doc, 4, 4, "老")               # 起点处插字：算引文外，区间右移
+    got = citation(client, doc, n)
+    assert got["status"] == "active"
+    assert (got["start"], got["end"]) == (5, 8)
+    correct(client, doc, 8, 8, "的")               # 终点处插字：算引文外，区间不动
+    got = citation(client, doc, n)
+    assert got["status"] == "active"
+    assert (got["start"], got["end"]) == (5, 8)
+    assert got["text"] == "北京市"
+
+
+def test_edit_inside_citation_suspends(client):
+    doc = import_doc(client, "张三住在北京市东城区。")
+    n = cite(client, doc, 0, 4, 7)
+    correct(client, doc, 5, 6, "津")               # 改删引文内“京”
+    got = citation(client, doc, n)
+    assert got["status"] == "suspended"
+    assert "text" not in got and "start" not in got and "end" not in got
+
+
+def test_insert_inside_citation_suspends(client):
+    doc = import_doc(client, "张三住在北京市东城区。")
+    n = cite(client, doc, 0, 4, 7)
+    correct(client, doc, 5, 5, "（音）")           # 在引文内部插字
+    got = citation(client, doc, n)
+    assert got["status"] == "suspended"
+
+
+def test_retract_restoring_text_inside_citation_suspends(client):
+    """撤回早先的纯删除，文字还原到引文内部：立即停供。"""
+    doc = import_doc(client, "ABCDEFGHIJ", entities=[])
+    correct(client, doc, 2, 5)                      # 1: 删 CDE -> ABFGHIJ
+    n = cite(client, doc, 1, 1, 4)                  # 引文 “BFG”
+    assert retract(client, doc, 1).status_code == 200
+    assert version(client, doc)["text"] == "ABCDEFGHIJ"
+    got = citation(client, doc, n)
+    assert got["status"] == "suspended"
+    assert "text" not in got
+
+
+def test_retract_restoring_text_outside_citation_shifts(client):
+    doc = import_doc(client, "ABCDEFGHIJ", entities=[])
+    correct(client, doc, 2, 5)                      # 1: 删 CDE -> ABFGHIJ
+    n = cite(client, doc, 1, 4, 6)                  # 现版 ABFGHIJ，引文 “HI”
+    assert retract(client, doc, 1).status_code == 200
+    got = citation(client, doc, n)
+    assert got["status"] == "active"
+    assert got["text"] == "HI"
+    assert (got["start"], got["end"]) == (7, 9)
+
+
+def test_restored_same_text_requires_new_citation(client):
+    """正文改回同样的文字，原号仍停供；须重新确认并发新号。"""
+    doc = import_doc(client, "张三住在北京市东城区。")
+    n1 = cite(client, doc, 0, 4, 7)
+    correct(client, doc, 5, 6, "津")                # 1: 停供
+    assert citation(client, doc, n1)["status"] == "suspended"
+    correct(client, doc, 5, 6, "京")                # 2: 改回原文
+    assert version(client, doc)["text"] == "张三住在北京市东城区。"
+    assert citation(client, doc, n1)["status"] == "suspended"
+    n2 = cite(client, doc, 2, 4, 7)
+    assert n2 == n1 + 1                             # 新号，不复用
+    got = citation(client, doc, n2)
+    assert got["status"] == "active" and got["text"] == "北京市"
+
+
+def test_citation_status_survives_unrelated_retraction(client):
+    doc = import_doc(client, "ABCDEFG", entities=[])
+    correct(client, doc, 0, 0, "x")                 # 1
+    n = cite(client, doc, 1, 1, 4)                  # 现版 “xABCDEFG”，引文 “ABC”
+    assert citation(client, doc, n)["text"] == "ABC"
+    retract(client, doc, 1)                         # 撤回文首插入，引文左移
+    got = citation(client, doc, n)
+    assert got["status"] == "active"
+    assert got["text"] == "ABC"
+    assert (got["start"], got["end"]) == (0, 3)
+
+
+def test_citations_listing(client):
+    doc = import_doc(client, "ABCDEFG", entities=[])
+    cite(client, doc, 0, 0, 2)
+    cite(client, doc, 0, 2, 4)
+    rows = client.get(f"/documents/{doc}/citations").json()
+    assert [r["citation_number"] for r in rows] == [1, 2]
+    assert [r["status"] for r in rows] == ["active", "active"]
+
+
+def test_failed_save_rolls_back_text_and_citation(client, monkeypatch):
+    """正文变更与引用状态/位置同一事务：保存失败则均保留原状。"""
+    doc = import_doc(client, "ABCDEFG", entities=[])
+    n = cite(client, doc, 0, 2, 4)                  # “CD”
+    before = citation(client, doc, n)
+
+    from app import db as dbmod
+    real = dbmod.save_pieces
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(dbmod, "save_pieces", boom)
+    with pytest.raises(RuntimeError):
+        client.post(f"/documents/{doc}/corrections",
+                    json={"start": 0, "end": 0, "text": "Z"})
+    monkeypatch.setattr(dbmod, "save_pieces", real)
+
+    # 正文、版号、引用位置与状态均未改变
+    v = version(client, doc)
+    assert v["text"] == "ABCDEFG" and v["revision"] == 0
+    assert citation(client, doc, n) == before

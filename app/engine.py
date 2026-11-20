@@ -180,6 +180,57 @@ def _fallback_pos(pieces: list[dict], x: int) -> int:
     return pos
 
 
+def transform_span(cs: int, ce: int, s: int, e: int, new_len: int):
+    """把编辑（当前版 [s, e) 换成 new_len 个字符）作用到区间 [cs, ce) 上。
+
+    返回编辑后该区间的新坐标；若编辑触及区间内部（改删了其中的字，或在其
+    内部插字）则返回 None（引文停供）。落在区间两个边界上的插入算在区间外：
+    起点的插入把整个区间右移，终点的插入不改变区间。
+
+    s < e 表示替换/删除，new_len 为替换文本长度（纯删除为 0）；
+    s == e 表示纯插入。
+    """
+    if s < e:
+        if s < ce and cs < e:
+            return None
+        delta = new_len - (e - s)
+        if e <= cs:
+            return cs + delta, ce + delta
+        return cs, ce
+    # 纯插入：严格落在区间内部才算触及
+    if new_len > 0 and cs < s < ce:
+        return None
+    if s <= cs:
+        return cs + new_len, ce + new_len
+    return cs, ce
+
+
+def correction_span(pieces: list[dict], src: int, kind: str) -> tuple[int, int]:
+    """编号 src 的勘误在当前版片段表上的位置 [start, end)。
+
+    纯删除返回接缝位置 (p, p)；插入/替换返回其写入片段覆盖的区间。
+    调用前须确认该勘误仍生效且无冲突的后续勘误（保证不变量成立）。
+    """
+    pos = 0
+    if kind == "delete":
+        for p in pieces:
+            if p["kind"] == "seam" and p["src"] == src:
+                return pos, pos
+            pos += p["b"] - p["a"]
+        raise InvariantError(f"seam of correction {src} not found")
+
+    start = end = None
+    for p in pieces:
+        plen = p["b"] - p["a"]
+        if p["kind"] == "ins" and p["src"] == src:
+            start = pos if start is None else start
+            end = pos + plen
+        pos += plen
+    if start is None:
+        raise InvariantError(f"inserted pieces of correction {src} not found")
+    return start, end
+
+
 def edit_touches_span(s: int, e: int, has_text: bool, ca: int, cb: int) -> bool:
     """判断应用于当前版 [s, e) 的编辑是否触及当前区间 [ca, cb) 的标注。
 

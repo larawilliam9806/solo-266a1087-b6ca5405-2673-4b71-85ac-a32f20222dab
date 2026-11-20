@@ -175,5 +175,45 @@ class TouchSpanTest(unittest.TestCase):
         self.assertFalse(T(8, 8, True, 4, 8))
 
 
+class SpanTransformTest(unittest.TestCase):
+    def test_distant_edit_shifts_span(self):
+        T = engine.transform_span
+        self.assertEqual(T(4, 7, 0, 0, 3), (7, 10))   # 文首插 3 字
+        self.assertEqual(T(4, 7, 0, 1, 0), (3, 6))    # 文首删 1 字
+        self.assertEqual(T(4, 7, 9, 11, 0), (4, 7))   # 文末远处删除
+
+    def test_boundary_inserts_count_as_outside(self):
+        T = engine.transform_span
+        self.assertEqual(T(4, 7, 4, 4, 2), (6, 9))    # 起点插入 -> 整体右移
+        self.assertEqual(T(4, 7, 7, 7, 2), (4, 7))    # 终点插入 -> 区间不变
+        self.assertEqual(T(4, 7, 0, 0, 1), (5, 8))
+
+    def test_inner_edits_suspend(self):
+        T = engine.transform_span
+        self.assertIsNone(T(4, 7, 5, 6, 1))           # 改删引文内文字
+        self.assertIsNone(T(4, 7, 5, 6, 0))           # 删引文内文字
+        self.assertIsNone(T(4, 7, 5, 5, 1))           # 引文内部插字
+        self.assertIsNone(T(4, 7, 3, 5, 1))           # 跨越起点改删（删到了内部）
+
+    def test_edit_adjacent_to_span_is_outside(self):
+        T = engine.transform_span
+        self.assertEqual(T(4, 7, 3, 4, 2), (5, 8))    # 替换紧邻起点左侧，区间右移
+        self.assertEqual(T(4, 7, 7, 9, 1), (4, 7))    # 替换紧邻终点右侧
+
+
+class CorrectionSpanTest(unittest.TestCase):
+    def test_span_of_insert_and_replace(self):
+        pieces = [engine.piece("orig", None, 0, 6)]
+        pieces, _, _ = engine.apply_edit(pieces, 3, 3, "XYZ", 1)
+        self.assertEqual(engine.correction_span(pieces, 1, "insert"), (3, 6))
+        pieces, _, _ = engine.apply_edit(pieces, 1, 2, "q", 2)
+        self.assertEqual(engine.correction_span(pieces, 2, "replace"), (1, 2))
+
+    def test_span_of_pure_delete_is_seam(self):
+        pieces = [engine.piece("orig", None, 0, 6)]
+        pieces, _, _ = engine.apply_edit(pieces, 2, 4, "", 1)
+        self.assertEqual(engine.correction_span(pieces, 1, "delete"), (2, 2))
+
+
 if __name__ == "__main__":
     unittest.main()

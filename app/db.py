@@ -1,8 +1,8 @@
 """SQLite 存储层（仅标准库）。
 
 每份转录稿（document）独立维护：原文、实体标注、勘误流水、片段表、
-标注受影响关系。勘误号在文档内从 1 开始递增，撤回后号码保留、状态置为
-retracted，不复用。
+标注受影响关系、展陈引文。勘误号与引用号各自在文档内从 1 开始递增，
+撤回/停供后号码保留、不复用。
 """
 
 from __future__ import annotations
@@ -62,6 +62,21 @@ CREATE TABLE IF NOT EXISTS entity_effects (
     entity_id         INTEGER NOT NULL,
     correction_number INTEGER NOT NULL,  -- 影响该标注的仍生效勘误
     PRIMARY KEY (document_id, entity_id, correction_number)
+);
+CREATE TABLE IF NOT EXISTS citations (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id       INTEGER NOT NULL REFERENCES documents(id),
+    number            INTEGER NOT NULL,                -- 引用号，文档内递增、不复用
+    correction_number INTEGER NOT NULL,                -- 确认时编辑提交的稿号
+    version_number    INTEGER NOT NULL,                -- 确认时所见的版号
+    text              TEXT NOT NULL,                   -- 核准文字快照
+    start             INTEGER NOT NULL,                -- 当前区间（随正文移动）
+    "end"             INTEGER NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'active'
+                      CHECK (status IN ('active', 'suspended')),
+    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    suspended_at      TEXT,
+    UNIQUE (document_id, number)
 );
 """
 
@@ -140,6 +155,25 @@ def active_conflicts_against(conn: sqlite3.Connection, doc_id: int, number: int)
         (doc_id, number),
     ).fetchall()
     return [r["n"] for r in rows]
+
+
+# ---- 引用 ----
+
+def load_active_citations(conn: sqlite3.Connection, doc_id: int) -> list[dict]:
+    rows = conn.execute(
+        'SELECT number, text, start, "end" FROM citations'
+        " WHERE document_id = ? AND status = 'active' ORDER BY number",
+        (doc_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def next_citation_number(conn: sqlite3.Connection, doc_id: int) -> int:
+    row = conn.execute(
+        "SELECT COALESCE(MAX(number), 0) + 1 AS n FROM citations WHERE document_id = ?",
+        (doc_id,),
+    ).fetchone()
+    return row["n"]
 
 
 # ---- JSON 序列化 ----

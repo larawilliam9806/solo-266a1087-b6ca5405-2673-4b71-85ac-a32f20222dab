@@ -8,6 +8,9 @@
 - GET    /documents/{doc_id}/corrections             勘误流水
 - GET    /documents/{doc_id}/entities                实体检索（kind / q 过滤）
 - GET    /documents/{doc_id}/entities/{number}       单个实体
+- POST   /documents/{doc_id}/citations               确认引文，取得引用号
+- GET    /documents/{doc_id}/citations               引用号列表
+- GET    /documents/{doc_id}/citations/{number}      查询引用号（有效/停供）
 """
 
 from __future__ import annotations
@@ -17,7 +20,7 @@ from typing import Literal, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from . import db, service
 
@@ -80,6 +83,23 @@ class CorrectionIn(BaseModel):
     text: str = Field(default="", description="替换文本；区间为空即插入，文本为空即删除")
 
 
+class CitationIn(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    draft_number: int = Field(
+        ge=0, validation_alias=AliasChoices(
+            "draft_number", "correction_number", "submission_number", "number"),
+        description="编辑提交稿号（非负）")
+    version_number: int = Field(
+        ge=0, validation_alias=AliasChoices(
+            "version_number", "revision", "seen_version", "version"),
+        description="确认时所见的版号，须等于现版，否则拒绝")
+    start: int = Field(ge=0, validation_alias=AliasChoices(
+        "start", "range_start"), description="现版区间起点（含）")
+    end: int = Field(ge=0, validation_alias=AliasChoices(
+        "end", "range_end"), description="现版区间终点（不含），须大于起点")
+
+
 # ---------------------------------------------------------------- 异常映射
 
 @app.exception_handler(service.NotFoundError)
@@ -99,6 +119,12 @@ async def conflict_handler(request, exc: service.ConflictError):
         status_code=409,
         content={"detail": str(exc), "conflicts": exc.conflicts},
     )
+
+
+@app.exception_handler(service.StaleVersionError)
+async def stale_version_handler(request, exc: service.StaleVersionError):
+    # 所见版号过期：拒绝确认引用
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 
 # ---------------------------------------------------------------- 路由
@@ -154,3 +180,21 @@ def entity(doc_id: int, number: int):
         if item["number"] == number:
             return item
     raise HTTPException(status_code=404, detail=f"实体编号不存在: {number}")
+
+
+@app.post("/documents/{doc_id}/citations", status_code=201)
+def confirm_citation(doc_id: int, payload: CitationIn):
+    """确认引文：版号须为现版，区间非空；返回引用号与核准文字快照。"""
+    return _write(service.confirm_citation, doc_id, payload.draft_number,
+                  payload.version_number, payload.start, payload.end)
+
+
+@app.get("/documents/{doc_id}/citations")
+def citations(doc_id: int):
+    return _read(service.list_citations, doc_id)
+
+
+@app.get("/documents/{doc_id}/citations/{number}")
+def citation(doc_id: int, number: int):
+    """查询引用号：有效则返回核准文字、现稿版号与当前区间；停供只报状态。"""
+    return _read(service.get_citation, doc_id, number)

@@ -1,7 +1,7 @@
-"""业务操作层（框架无关）：导入、勘误、撤回、版本查询、实体检索。
+"""业务操作层（框架无关）：导入、勘误、撤回、版本查询、实体检索、展陈引文。
 
 所有写操作在单个事务内完成；版本查询在一次读事务内取正文与标注，
-保证“从同一版返回”。
+保证“从同一版返回”。引用的状态与位置随正文变更在同一事务内更新。
 """
 
 from __future__ import annotations
@@ -23,6 +23,10 @@ class ConflictError(Exception):
     def __init__(self, message: str, conflicts: list[int]):
         super().__init__(message)
         self.conflicts = conflicts
+
+
+class StaleVersionError(Exception):
+    pass
 
 
 # ---------------------------------------------------------------- 导入
@@ -92,6 +96,9 @@ def apply_correction(conn: sqlite3.Connection, doc_id: int,
         if engine.edit_touches_span(s, e, bool(text), ca, cb):
             effects.append(ent["id"])
 
+    # 引用随之移动或停供（与正文变更同一事务）
+    _shift_citations(conn, doc_id, s, e, len(text))
+
     conn.execute(
         "INSERT INTO corrections"
         " (document_id, number, kind, text, range_start, range_end,"
@@ -139,6 +146,11 @@ def retract_correction(conn: sqlite3.Connection, doc_id: int, number: int) -> di
     deleted = db.loads_pieces(row["deleted_pieces"])
     new_pieces = engine.revert_edit(pieces, deleted, number, row["kind"])
 
+    # 撤回把文字还原回现版：若还原内容落在某引文内部，该引用随即停供。
+    # 位置取勘误还原前后的当前坐标（还原前该笔写入内容仍在位）。
+    rs, re_ = engine.correction_span(pieces, number, row["kind"])
+    _shift_citations(conn, doc_id, rs, re_, len(row["deleted_text"]))
+
     db.save_pieces(conn, doc_id, new_pieces)
     conn.execute(
         "UPDATE corrections SET status = 'retracted'"
@@ -152,6 +164,86 @@ def retract_correction(conn: sqlite3.Connection, doc_id: int, number: int) -> di
     )
     revision = _bump_revision(conn, doc_id)
     return {"retracted": number, "revision": revision}
+
+
+# ---------------------------------------------------------------- 引用
+
+def confirm_citation(conn: sqlite3.Connection, doc_id: int,
+                     correction_number: int, version_number: int,
+                     s: int, e: int) -> dict:
+    """确认引文：凭编辑提交的稿号、所见版号与非空左闭右开区间取得引用号。
+
+    版号必须等于当前版（过期的所见版拒绝确认）；区间必须非空且落在现版内。
+    """
+    doc = _get_document(conn, doc_id)
+    if version_number != doc["revision"]:
+        raise StaleVersionError(
+            f"所见版号 {version_number} 已过期，当前版为 {doc['revision']}")
+    if correction_number < 0:
+        raise ValidationError("稿号必须是非负整数")
+
+    pieces = db.load_pieces(conn, doc_id)
+    total = engine.total_length(pieces)
+    if not (0 <= s < e <= total):
+        raise ValidationError(
+            f"引文区间须非空且落在现版 [0, {total}) 内：收到 [{s}, {e})")
+
+    text = engine.render(pieces, doc["original_text"],
+                         db.correction_texts(conn, doc_id))[s:e]
+    number = db.next_citation_number(conn, doc_id)
+    conn.execute(
+        'INSERT INTO citations'
+        ' (document_id, number, correction_number, version_number, text, start, "end")'
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (doc_id, number, correction_number, version_number, text, s, e),
+    )
+    return {
+        "citation_number": number,
+        "status": "active",
+        "text": text,
+        "version_number": version_number,
+        "document_revision": doc["revision"],
+        "draft_number": correction_number,
+        "start": s,
+        "end": e,
+    }
+
+
+def get_citation(conn: sqlite3.Connection, doc_id: int, number: int) -> dict:
+    """查询引用号：有效时返回核准文字、现稿版号与当前区间；停供只报状态。"""
+    doc = _get_document(conn, doc_id)
+    row = conn.execute(
+        "SELECT * FROM citations WHERE document_id = ? AND number = ?",
+        (doc_id, number),
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(f"引用号不存在: {number}")
+    out = {
+        "citation_number": row["number"],
+        "status": row["status"],
+        "draft_number": row["correction_number"],
+        # 现稿版号；确认时所见版号另以 confirmed_version 留存
+        "version_number": doc["revision"],
+        "document_revision": doc["revision"],
+        "confirmed_version": row["version_number"],
+    }
+    if row["status"] == "active":
+        # 仍核准：返回核准文字快照与随正文移动后的当前区间
+        out["text"] = row["text"]
+        out["start"] = row["start"]
+        out["end"] = row["end"]
+    else:
+        # 停供：只报状态，不再返回文字与区间
+        out["suspended_at"] = row["suspended_at"]
+    return out
+
+
+def list_citations(conn: sqlite3.Connection, doc_id: int) -> list[dict]:
+    _get_document(conn, doc_id)
+    rows = conn.execute(
+        "SELECT number FROM citations WHERE document_id = ? ORDER BY number", (doc_id,)
+    ).fetchall()
+    return [get_citation(conn, doc_id, r["number"]) for r in rows]
 
 
 # ---------------------------------------------------------------- 查询
@@ -235,6 +327,31 @@ def list_documents(conn: sqlite3.Connection) -> list[dict]:
 
 
 # ---------------------------------------------------------------- 内部
+
+def _shift_citations(conn: sqlite3.Connection, doc_id: int,
+                     s: int, e: int, new_len: int) -> None:
+    """把正文编辑（当前版 [s, e) -> new_len 字）反映到仍有效的引用上。
+
+    编辑只改到引文外：区间随正文平移；编辑改删引文内的字、或在引文内部
+    插字：该引用停供（状态置 suspended，此后只报状态）。两处更新与正文
+    变更共处同一事务，保存失败则一并回滚。
+    """
+    for cit in db.load_active_citations(conn, doc_id):
+        moved = engine.transform_span(cit["start"], cit["end"], s, e, new_len)
+        if moved is None:
+            conn.execute(
+                "UPDATE citations SET status = 'suspended',"
+                " suspended_at = datetime('now')"
+                " WHERE document_id = ? AND number = ?",
+                (doc_id, cit["number"]),
+            )
+        elif moved != (cit["start"], cit["end"]):
+            conn.execute(
+                'UPDATE citations SET start = ?, "end" = ?'
+                " WHERE document_id = ? AND number = ?",
+                (moved[0], moved[1], doc_id, cit["number"]),
+            )
+
 
 def _get_document(conn: sqlite3.Connection, doc_id: int) -> sqlite3.Row:
     row = conn.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
